@@ -1,0 +1,749 @@
+#!/usr/bin/env python3
+
+import os, re, logging, argparse, sys, multiprocessing, shutil, subprocess, itertools, gzip, glob
+
+import pandas as pd
+import numpy as np
+from scipy.stats import gaussian_kde, zscore
+
+import plotly.express as px
+import plotly.offline as opy
+
+
+__version__ = "0.1.0"
+
+# CONSTANT DEFINITION   
+
+# PAF Alignment
+CS_RE = re.compile(':[0-9]+|\*[a-z][a-z]|[=\+\-][A-Za-z]+')
+MINIMAP_TAGS = {
+    'tp' : 'AlignmentType',
+    'cm' : 'MinimizerCount',
+    's1' : 'ChainingScore',
+    's2' : 'SecondaryChainingScore',
+    'NM' : 'MismatchCount',
+    'MD' : 'MDTag',
+    'AS' : 'DPScore',
+    'ms' : 'MaxScoringDPScore',
+    'nn' : 'AmbiguousBases',
+    'ts' : 'TranscriptStrand',
+    'cg' : 'CIGAR',
+    'cs' : 'CSTag',
+    'dv' : 'PerBaseDivergence',
+    'de' : 'CompressedPerBaseDivergence',
+    'rl' : 'RepeatLength'
+}
+
+# FASTQ Quality Score
+SANGER_SCORE_OFFSET = 33
+QMAPPING = {
+            chr(letter): letter - SANGER_SCORE_OFFSET
+            for letter in range(SANGER_SCORE_OFFSET, 94 + SANGER_SCORE_OFFSET)
+        }
+
+pd.set_option('colheader_justify', 'center')
+
+
+def main():
+    init_logging()
+    logging.info("LoReQC (version {})".format(__version__))
+
+    args = get_arguments()
+
+    logging.info("Starting LoReQC Pipeline")
+
+    ######################################################################
+    # STARTING THE PIPELINE 
+    # The file structure required for the analysis is generated 
+    ######################################################################
+
+    # Check that all the required tools are present
+    logging.info('Checking dependancies')
+    check_dependencies()
+
+    # Create the output directory
+    if os.path.exists(args.output):
+        if args.force:
+            try:
+                shutil.rmtree(args.output)
+                os.mkdir(args.output)
+            except OSError:
+                logging.error("Cannot create the output directory")
+                sys.exit(1)
+        else:
+            logging.error("Cannot create the output directory")
+            sys.exit(1)
+    else:
+        try:
+            os.mkdir(args.output)
+        except OSError:
+            logging.error("Cannot create the output directory")
+            sys.exit(1)
+
+    # Empty file to store unwanted program output 
+    fnull = open(os.devnull, 'w')
+
+    ######################################################################
+    # GENERATE THE STATISTICS FOR THE READS
+    # Reads the read file to get the reads lengths 
+    ######################################################################
+
+    logging.info("Parsing the FASTQ file")
+
+    # Generate the names based on the file name
+    files = dict()
+    for file in args.reads:
+        name = os.path.splitext(os.path.basename(file.strip('.gz')))[0]
+
+        if not name in files:
+            files[name] = file 
+        else:
+            logging.error("File names must be unique.")
+            sys.exit(1)
+
+    # Generate the reads statistics
+    reads_statistics = dict()
+    for name, file in files.items():
+        reads_df = parse_fastq(file, args.threads)
+        reads_statistics[name] = reads_df
+
+    ######################################################################
+    # ALIGN NANOPORE READS AGAINST THE REFERENCE
+    # The reads are aligned against the reference with minimap2
+    # and the statistics are generated from the PAF output using the 
+    # CS tag
+    ######################################################################
+
+    logging.info("Aligning the reads against the assembly")
+
+    for name, file in files.items():
+        paf_file = os.path.join(args.output, 'tmp_mapping_{}.paf'.format(name))
+        command = ["minimap2", "-x", args.read_type, '-t', str(args.threads), '--cs', '--secondary=no', args.genome, file]
+        f = open(paf_file, 'w')
+        try:
+            subprocess.run(command, stdout=f, stderr=subprocess.PIPE, check=True)
+        except subprocess.CalledProcessError as e:
+            f.close()
+            logging.error('An error occured during the alignment. Dumping minimap2 log for debugging.')
+            logging.error('{}'.format(e.stderr.decode().strip()))
+            exit(1)
+        f.close()
+
+    logging.info('Parsing the alignment')
+
+    alignment_statistics = dict()
+    for name, file in files.items():
+        paf_file = os.path.join(args.output, 'tmp_mapping_{}.paf'.format(name))
+        ali_df = parse_paf(paf_file, args.threads)
+        alignment_statistics[name] = ali_df
+
+    logging.info('Generating statistics')
+    
+    # Generate the alignment stats
+    names = sorted(list(files.keys()))
+
+    # Prepare the data and generate the html report
+    write_html(names, reads_statistics, alignment_statistics, os.path.join(args.output, 'Report.html'))
+    write_csv(names, reads_statistics, alignment_statistics, os.path.join(args.output, 'Data.csv'))
+
+    # Remove the temporary files 
+    to_remove = glob.glob(args.output + '/tmp_*')
+
+    for path in to_remove:
+        try:
+            os.remove(path)
+        except:
+            logging.warning('An error occured when remove the temporary PAF file.')
+
+    # Close the empty file
+    fnull.close()
+
+
+def parse_paf(in_file, threads):
+    """
+    Parse a PAF file to extract the alignment informations
+
+    Arguments:
+        in_file: PAF file path
+    
+    Return:
+        Alignment stats dataframe
+            ID | Aligned | Error | Match | Mismatch | Insertion | Deletion
+    """
+
+    chunks = generate_chunks(threads)
+
+    content = []
+    
+    i = 0
+    with open(in_file) as handle:
+        for line in handle:
+            if i >= threads:
+                i = 0
+            chunks[i].append(line)
+
+            # Process the reads when each threads has 10000 reads to process
+            # This seems like a good trade off between the overhead required for 
+            # multi-threading and the memory usage required to load the reads in memory
+            if len(chunks[-1]) == 100: 
+                content.extend(parse_paf_chunks(chunks, threads))
+                chunks = generate_chunks(threads)
+            i += 1
+
+    content.extend(parse_paf_chunks(chunks, threads))
+
+    ali_df = pd.DataFrame(content, columns=['ID', 'AlignmentLength', 'AlignedFraction', 'Error', 'Match', 'Mismatch', 'Insertion', 'Deletion', 'Target', 'Start', 'End'])
+    ali_df.sort_values(by = ['ID', 'AlignedFraction'], inplace=True, ascending=False)
+    ali_df.drop_duplicates(subset='ID', keep='first', inplace=True)
+
+    return ali_df
+
+
+def parse_paf_chunks(chunks, threads):
+    """Parse the fastq chunks in multi-threads
+    
+    Argument:
+        chunks: List of the FASTQ chunks to be processed
+        
+    Return:
+        List of the parsed FASTQ lines
+    """
+
+    pool = multiprocessing.Pool(processes=threads)
+    res = list(itertools.chain.from_iterable(pool.imap(process_paf_chunk, chunks)))
+    pool.close()
+    pool.join()
+
+    return res
+
+
+def process_paf_chunk(chunk):
+    """
+    Parses chunks of PAF lines (by default each chunks contains 1,000,000 lines). Each sequences are sent to the parse_paf_line function that parses the line and generate the Alignments objects for the line. This function is accelerated by multiprocessing. 
+
+    Arguments:
+        chunk: [] of paf file line (string)
+
+    Return:
+        [] for Alignments objects
+    """
+    alignments = []
+    for line in chunk:
+        alignments.append(process_paf_line(line))
+
+    return alignments
+
+
+def process_paf_line(line):
+    """
+    Parses a PAF file record (a single line). 
+
+    Arguments:
+        line: PAF file line
+
+    Return:
+        Alignment object for this line
+    """
+
+    # Prepare the line
+    lst = line.strip().split('\t')
+    default_fields = lst[:12]
+    sam_keys_values = lst[12:]
+    sam_fields = parse_sam_fields(sam_keys_values)
+
+    # Extract the required fields from the PAF file
+    query_name = default_fields[0]
+    query_length = int(default_fields[1])
+    query_start = int(default_fields[2])
+    query_end = int(default_fields[3])
+    #if default_fields[4] == '+':
+    #    strand = 0
+    #else:
+    #    strand = 1
+    target_name = default_fields[5]
+    target_start = int(default_fields[7])
+    target_end = int(default_fields[8])
+    
+    cs_count, cs_tags = parse_cs_tag(sam_fields['cs'])
+    cs_df = pd.DataFrame({'Tag':cs_tags, 'Count':cs_count})
+    cs_df.sort_values(by = 'Tag', inplace=True)
+    cs_sum = cs_df.groupby(['Tag']).sum()
+
+    # Generate the statistics
+    
+    try:
+        match = cs_sum.loc[0]['Count']
+    except KeyError:
+        match = 0
+
+    try:
+        mismatch = cs_sum.loc[1]['Count']
+    except KeyError:
+        mismatch = 0
+
+    try:
+        deletion = cs_sum.loc[2]['Count']
+    except KeyError:
+        deletion = 0
+
+    try:
+        insertion = cs_sum.loc[3]['Count']
+    except KeyError:
+        insertion = 0
+
+    alignment_length = np.sum([match, mismatch, deletion, insertion]) # Alignment length is the number of columns in the alignment
+
+    error = (1-cs_sum.loc[0]['Count']/alignment_length)*100
+    match = (match/alignment_length)*100
+    mismatch = (mismatch/alignment_length)*100
+    deletion = (deletion/alignment_length)*100
+    insertion = (insertion/alignment_length)*100
+
+    aligned = (query_end-query_start)/query_length
+
+    return (query_name, alignment_length, aligned, error, match, mismatch, insertion, deletion, target_name, target_start, target_end)
+
+
+def parse_cs_tag(cs_tag):
+    """
+    Parse a CS Tag string. Extract features and lengths to two difference numpy array to decrease the memory requirements to store PAF data. 
+    
+    Unsigned 16 bytes int are used to store lengths. Sequence with any feature longer than that will be discarded. 
+    Unsigned 8 bytes int are used to store the feature types. 
+        0: Match
+        1: Mismatch
+        2: Deletion
+        3: Insertion
+    """
+
+    cs_lst = re.findall(CS_RE, cs_tag)
+    
+    length = np.empty(len(cs_lst), dtype=np.int16)
+    feature_type = np.empty(len(cs_lst), dtype=np.int8)
+    i = 0
+    for tag in cs_lst:
+        if tag[0] == ':':
+            feature_type[i] = 0
+            length[i] = int(tag[1:])
+        elif tag[0] == '*':
+            feature_type[i] = 1
+            length[i] = 1
+        elif tag[0] == '-':
+            feature_type[i] = 2
+            length[i] = len(tag[1:])
+        elif tag[0] == '+':
+            feature_type[i] = 3
+            length[i] = len(tag[1:])
+        i += 1
+
+    return length, feature_type
+
+
+def parse_sam_fields(sam_keys_values):
+    """
+    Parse the SAM-types fields from minimap PAF file
+
+    Arguments: 
+        [] of SAM-type fields
+    Return:
+        dict[key] = value for each fields
+    """
+
+    sam_dict = dict()
+    for sam_key_value in sam_keys_values:
+        sam_dict[sam_key_value[:2]] = sam_key_value[5:]
+    return sam_dict
+
+
+def parse_fastq(in_file, threads):
+    """
+    Generate the reads statistics from the FASTQ file
+
+    Arguments:
+        in_file: FASTQ file
+
+    Return:
+        Reads statistics dataframe
+    """
+
+    # Open the FASTQ file in gzip or uncompressed format
+    if in_file.endswith(".gz"):
+        handle = gzip.open(in_file, 'rt')
+    else:
+        handle = open(in_file, 'r')
+
+    # Generate the chunks
+    chunks = generate_chunks(threads)
+
+    content = []
+
+    i = 0
+    j = 0
+    for line in handle:
+        if j >= threads:
+            j = 0
+            
+        if i%4 == 0:
+            rid = line.split(' ')[0][1:]
+        elif i%4 == 1:
+            length = len(line.strip())
+        elif i%4 == 3:
+            chunks[j].append((rid, length, line.strip()))
+            j += 1
+
+            # Process the reads when each threads has 1000 reads to process
+            # This seems like a good trade off between the overhead required for 
+            # multi-threading and the memory usage required to load the reads in memory
+            if len(chunks[-1]) == 1000: 
+                content.extend(parse_fastq_chunks(chunks, threads))
+                chunks = generate_chunks(threads)
+        i += 1
+
+    content.extend(parse_fastq_chunks(chunks, threads))
+
+    handle.close()
+
+    reads_df = pd.DataFrame(content, columns=['ID', 'Length', 'MedianPHRED'])
+    
+    return reads_df
+
+
+def parse_fastq_chunks(chunks, threads):
+    """Parse the fastq chunks in multi-threads
+    
+    Argument:
+        chunks: List of the FASTQ chunks to be processed
+        
+    Return:
+        List of the parsed FASTQ lines
+    """
+
+    pool = multiprocessing.Pool(processes=threads)
+    res = list(itertools.chain.from_iterable(pool.imap(parse_fastq_chunk, chunks)))
+    pool.close()
+    pool.join()
+
+    return res
+
+
+def parse_fastq_chunk(chunk):
+    """Parse the fastq line
+    
+    Argument:
+        chunk: Chunk of FASTQ file
+        
+    Return:
+        Parsed chunk as a list of tuples
+    """
+
+    for i in range(0, len(chunk)):
+        chunk[i] = ((chunk[i][0], chunk[i][1], qual_to_phred(chunk[i][2])))
+    
+    return chunk
+
+
+def qual_to_phred(qual):
+    """
+    Convert a quality string to a PHRED score array
+    
+    Arguments:
+        qual: Quality string
+
+    Return:
+        Numpy array of PHRED scores
+    """
+
+    phred = np.array([QMAPPING[letter] for letter in qual], dtype=np.int8)
+    return np.median(phred)
+
+
+def generate_chunks(length):
+    """Return a list of empty list with the given length"""
+    chunks = []
+    for i in range(0, length):
+        chunks.append([])
+    return chunks
+
+
+def init_logging():
+    """Initialize the logger"""
+
+    logger = logging.getLogger()
+    logger.setLevel(logging.DEBUG)
+
+    handler = logging.StreamHandler()
+    handler.setLevel(logging.DEBUG)
+
+    formatter = logging.Formatter('%(asctime)s %(levelname)s    %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+    handler.setFormatter(formatter)
+
+    logger.addHandler(handler)
+    
+
+def check_dependencies():
+    """Check that minimap2 is present otherwise exit with an error"""
+
+    if shutil.which("minimap2"):
+        proc = subprocess.run(["minimap2", "-V"], stdout=subprocess.PIPE)
+        version = proc.stdout.decode().strip()
+        logging.info("Found minimap2 (v{})".format(version))
+    else:
+        logging.error("Cannot find minimap2")
+        sys.exit(1)
+
+
+def get_arguments():
+    """Argument parser function"""
+
+    parser = argparse.ArgumentParser(description='LoReQC: A Long Nanopore/PacBio Reads QC tool', add_help=False)
+
+    show_all_args = '--complete-help' in sys.argv
+
+    input_group = parser.add_argument_group('Input')
+    input_group.add_argument('-g', '--genome', required=True, type=str,  
+                      help='Genome file (FASTA)')
+    input_group.add_argument('-r', '--reads', required=True, type=str, nargs='+',
+                      help='Reads file (FASTQ)')
+    input_group.add_argument('-x', '--read-type', required=True,type=str,  
+                      help='Read type (nanopore or pacbio) for minimap2 presets')
+
+    output_group = parser.add_argument_group('Output')
+    output_group.add_argument('-o', '--output', required=True, 
+                        help='Output directory')
+    output_group.add_argument('--force', required=False, action='store_true',
+                        help='Overwrite existing file')
+
+    resources_group = parser.add_argument_group('Resources')
+    resources_group.add_argument('-t', '--threads', type=int, required=False, default=0,
+                        help='Number of threads used (default: 0 or use all threads)')
+
+    help_group = parser.add_argument_group('Help')
+    help_group.add_argument('-h', '--help', action='help',
+                            help='Show this help message and exit')
+    help_group.add_argument('--complete-help', action='help',
+                            help='Show a help message with all program options')
+    help_group.add_argument('--version', action='version', version='PyHMMview v{}'.format(__version__),
+                            help="Show PyHMMview's version")
+        
+    if len(sys.argv) == 1:
+        parser.print_help(file=sys.stderr)
+        sys.exit(1)
+
+    args = parser.parse_args()
+        
+    # Set the threads count
+    if args.threads == 0:
+        args.threads = multiprocessing.cpu_count()
+
+    if args.read_type.lower() == 'nanopore':
+        args.read_type = 'map-ont'
+    elif args.read_type.lower() == 'pacbio':
+        args.read_type = 'map-pb'
+    else:
+        logging.error("Unknown read type {}".format(args.read_type))
+        sys.exit(1)
+
+    return args
+
+
+def summary(names, reads_statistics, alignment_statistics):
+    """
+    Generate the summary statistics from the alignment and reads statistics
+
+    Arguments:
+        names: List of dataset names (the keys of the following dicts)
+        reads_statistics: Dict of reads statistics dataframe for each dataset
+        alignment_statistics: Dict of alignment statistics dataframe for each dataset
+
+    Return:
+        summary dataframe (ready to generate the table in the report)
+    """
+
+    content = []
+    header = []
+    for name in names:
+        data = []
+        header.append(name)
+        dataset_reads_stats = reads_statistics[name]
+        dataset_ali_stats = alignment_statistics[name]
+
+        # General read statistics
+        total_bases = dataset_reads_stats['Length'].sum()
+        data.append("{:.0f}".format(total_bases))
+
+        number_of_reads = len(dataset_reads_stats)
+        data.append("{:.0f}".format(number_of_reads))
+
+        data.append("{:.0f}".format(dataset_reads_stats['Length'].max()))
+        data.append("{:.0f}".format(N50(dataset_reads_stats['Length'].to_list())))
+        data.append("{:.0f}".format(dataset_reads_stats['Length'].median()))
+        data.append("{:.0f}".format(dataset_reads_stats['Length'].mean()))
+
+        # General alignment statistics
+        aligned_bases = dataset_ali_stats['AlignmentLength'].sum()
+        data.append("{:.0f}".format(aligned_bases))
+        
+        data.append("{:.2f}".format((aligned_bases/total_bases)*100))
+
+        aligned_reads = len(dataset_ali_stats)
+        data.append("{:.0f}".format(aligned_reads))
+
+        data.append("{:.2f}".format((aligned_reads/number_of_reads)*100))
+        data.append("{:.2f}".format(dataset_ali_stats['Match'].mean()))
+        data.append("{:.2f}".format(dataset_ali_stats['Insertion'].mean()))
+        data.append("{:.2f}".format(dataset_ali_stats['Deletion'].mean()))
+        data.append("{:.2f}".format(dataset_ali_stats['Mismatch'].mean()))
+        content.append(data)
+
+    df = pd.DataFrame(zip(*content), dtype="string")
+    df.columns = header
+    df.index = ['Total Bases', 'Number of Reads', 'Longest Read', 'N50', 'Median Length',
+                'Mean Length', 'Aligned Bases', 'Aligned Bases Fraction', 'Aligned Reads', 
+                'Aligned Reads Fraction', 'Mean Identity', 'Mean Insertion Rate', 
+                'Mean Deletion Rate', 'Mean Mismatch Rate']
+
+    return df.to_html(classes='table table-striped table-borderless', border=0).replace("<thead>", "<thead class='thead-dark'>")
+
+
+def N50(lengths):
+    """
+    Returns the N50 value 
+
+    Source:
+    https://gist.github.com/dinovski/2bcdcc770d5388c6fcc8a656e5dbe53c
+    """
+
+    sorted_lengths=sorted(lengths, reverse=True)
+    csum=np.cumsum(sorted_lengths)
+    n2=int(sum(lengths)/2)
+
+    # get index for cumsum >= N/2
+    csumn2=min(csum[csum >= n2])
+    ind=np.where(csum == csumn2)
+    n50 = sorted_lengths[ind[0][0]]
+
+    return n50
+
+
+def density_plot(names, in_df, variable_name, xlab, zscore_threshold=3):
+    """Returns a Plotly Gaussian Kernel Density plot"""
+
+    # Prepare the data
+    prep_df = pd.DataFrame()
+    for name in names:
+        stats_dataset = in_df[name]
+        variable = stats_dataset[variable_name][(zscore(stats_dataset[variable_name]) < zscore_threshold)]
+        prep_df[name] = variable
+
+    # Generate the plot
+    plt_df = pd.DataFrame()
+    x_grid = np.linspace(0, prep_df.max().max(), num=1000) # Grid used for plotting the density
+    names = []
+    for column in prep_df:
+        names.append(column)
+        kde = gaussian_kde(prep_df[column].dropna().to_list())
+        evaluated = kde.evaluate(x_grid)
+        plt_df[column] = evaluated*100
+    plt_df['x_grid'] = x_grid
+
+    fig = px.line(plt_df, x="x_grid", y=names, template="simple_white", width=None, height=500,
+    labels={"value": "Density of Reads",  "x_grid": xlab, "variable": "Dataset"})
+    fig.update_layout({
+    'plot_bgcolor': 'rgba(0, 0, 0, 0)',
+    'paper_bgcolor': 'rgba(0, 0, 0, 0)',
+    'xaxis': {'tickformat': 'r'}
+    })
+    url = opy.plot(fig, auto_open=False, output_type='div')
+    return url
+
+
+def density_contour_plot(names, reads_statistics, alignments_statistics, xvar, yvar, xlab, ylab, zscore_threshold = 1):
+    """
+
+    """
+
+    # Prepare the data
+    intermediate_df = []
+    for name in names:
+        reads_dataset = reads_statistics[name]
+        filtered_reads = reads_dataset[(zscore(reads_dataset[xvar]) < zscore_threshold)]
+        reads = filtered_reads[["ID", xvar]]
+
+        alignments_dataset = alignments_statistics[name]
+        filtered_alignments = alignments_dataset[(zscore(alignments_dataset[yvar]) < zscore_threshold)]
+        alignments = filtered_alignments[["ID", yvar]]
+        merge_df = pd.merge(reads, alignments, how ='inner', on =['ID'])
+
+        merge_df["Name"] = name
+
+        intermediate_df.append(merge_df)
+
+    prep_df = pd.concat(intermediate_df)
+
+    fig = px.density_contour(prep_df, x=xvar, y=yvar, color="Name", 
+    template="simple_white", width=None, height=500, 
+    labels={xvar: xlab,  yvar: ylab, "variable": "Dataset"})
+
+    fig.update_layout({
+    'plot_bgcolor': 'rgba(0, 0, 0, 0)',
+    'paper_bgcolor': 'rgba(0, 0, 0, 0)',
+    'xaxis': {'tickformat': 'r'}
+    })
+
+    url = opy.plot(fig, auto_open=False, output_type='div')
+    return url
+
+
+def write_html(names, reads_statistics, alignment_statistics, out_file):
+    html_string = '''<html>
+    <head>
+        <link rel="stylesheet" href="https://maxcdn.bootstrapcdn.com/bootstrap/4.0.0/css/bootstrap.min.css">
+        <style>body{ margin:0 100; background:whitesmoke; }</style>
+    </head>
+    <body>
+        <h1>LoReQC: Long Reads Quality Control Report</h1>
+
+        <h3>Summary</h3></br>
+        ''' + summary(names, reads_statistics, alignment_statistics) + '''
+
+        <h2>Reads Statistics</h2>
+
+        <h3>Basecalled reads length</h3>
+        ''' + density_plot(names, reads_statistics, 'Length', "Reads Length") + '''
+
+        <h3>Basecalled reads PHRED quality</h3>
+        ''' + density_plot(names, reads_statistics, 'MedianPHRED', "Reads Median PHRED Score") + '''
+
+        <h2>Alignment Statistics</h2>
+
+        <h3>Aligned reads identity</h3>
+        ''' + density_plot(names, alignment_statistics, 'Error', "Error Rate") + '''
+
+        <h3>Basecalled reads length vs alignments length</h3>
+        ''' + density_contour_plot(names, reads_statistics, alignment_statistics, "Length", "AlignmentLength", "Reads Length", "Alignment Length") + '''
+
+        <h3>Reads PHRED quality vs alignments identity</h3>
+        ''' + density_contour_plot(names, reads_statistics, alignment_statistics, "MedianPHRED", "Match", "Reads Median PHRED Score", "Alignment Identity") + '''
+    </body>
+</html>'''
+
+
+    with open(out_file, 'w') as w_handle:
+        w_handle.write(html_string)
+
+
+def write_csv(names, reads_statistics, alignment_statistics, out_file):
+    """Write the statistics to a CSV file"""
+    df_list = []
+    for name in names:
+        dataset_reads_statistics = reads_statistics[name]
+        dataset_alignments_statistics = alignment_statistics[name]
+        dataset_statistics = pd.merge(dataset_reads_statistics, dataset_alignments_statistics, how="left", on="ID")
+        dataset_statistics.insert(loc = 0, column = 'Name', value = name)
+        df_list.append(dataset_statistics)
+    out_df = pd.concat(df_list)
+    out_df.to_csv(out_file, index=False)
+
+
+if __name__ == '__main__':
+    main()
