@@ -7,10 +7,12 @@ import numpy as np
 from scipy.stats import gaussian_kde, zscore
 
 import plotly.express as px
-import plotly.offline as opy
+import plotly.io as pio
 
 
+pio.renderers.default = "iframe_connected"
 __version__ = "0.1.0"
+
 
 # CONSTANT DEFINITION   
 
@@ -36,6 +38,7 @@ MINIMAP_TAGS = {
 
 # FASTQ Quality Score
 SANGER_SCORE_OFFSET = 33
+
 
 pd.set_option('colheader_justify', 'center')
 
@@ -634,7 +637,7 @@ def density_plot(names, in_df, variable_name, xlab, zscore_threshold=3):
 
     # Generate the plot
     plt_df = pd.DataFrame()
-    x_grid = np.linspace(0, prep_df.max().max(), num=1000) # Grid used for plotting the density
+    x_grid = np.linspace(0, prep_df.max().max(), num=100) # Grid used for plotting the density
     names = []
     for column in prep_df:
         names.append(column)
@@ -650,14 +653,19 @@ def density_plot(names, in_df, variable_name, xlab, zscore_threshold=3):
     'paper_bgcolor': 'rgba(0, 0, 0, 0)',
     'xaxis': {'tickformat': 'r'}
     })
-    url = opy.plot(fig, auto_open=False, output_type='div')
-    return url
+
+    # Supress Plotly show() stdout
+    devnull = open(os.devnull, "w")
+    _stdout = sys.stdout
+    sys.stdout = devnull
+    fig.show()
+    sys.stdout = _stdout
+
+    return get_iframe_div()
 
 
 def density_contour_plot(names, reads_statistics, alignments_statistics, xvar, yvar, xlab, ylab, zscore_threshold = 1):
-    """
-
-    """
+    """Returns a Plotly Density Contour plot"""
 
     # Prepare the data
     intermediate_df = []
@@ -687,8 +695,22 @@ def density_contour_plot(names, reads_statistics, alignments_statistics, xvar, y
     'xaxis': {'tickformat': 'r'}
     })
 
-    url = opy.plot(fig, auto_open=False, output_type='div')
-    return url
+    # Supress Plotly show() stdout
+    devnull = open(os.devnull, "w")
+    _stdout = sys.stdout
+    sys.stdout = devnull
+    fig.show()
+    sys.stdout = _stdout
+
+    return get_iframe_div()
+
+
+def get_iframe_div():
+    """Extract and return an iframe div"""
+
+    with open(os.path.join(os.getcwd(), 'iframe_figures', 'figure_0.html')) as handle:
+        content = '\n'.join(handle.read().split('\n')[4:-2])
+    return content
 
 
 def write_html(names, reads_statistics, alignment_statistics, out_file):
@@ -706,21 +728,21 @@ def write_html(names, reads_statistics, alignment_statistics, out_file):
         <h2>Reads Statistics</h2>
 
         <h3>Basecalled reads length</h3>
-        ''' + density_plot(names, reads_statistics, 'Length', "Reads Length") + '''
+        <iframe height="600px" width="100%" frameBorder="0" srcdoc=' ''' + density_plot(names, reads_statistics, 'Length', "Reads Length") + ''' '></iframe>
 
         <h3>Basecalled reads PHRED quality</h3>
-        ''' + density_plot(names, reads_statistics, 'MedianPHRED', "Reads Median PHRED Score") + '''
+        <iframe height="600px" width="100%" frameBorder="0" srcdoc=' ''' + density_plot(names, reads_statistics, 'MedianPHRED', "Reads Median PHRED Score") + ''' '></iframe>
 
         <h2>Alignment Statistics</h2>
 
         <h3>Aligned reads identity</h3>
-        ''' + density_plot(names, alignment_statistics, 'Error', "Error Rate") + '''
+        <iframe height="600px" width="100%" frameBorder="0" srcdoc=' ''' + density_plot(names, alignment_statistics, 'Error', "Error Rate") + ''' '></iframe>
 
         <h3>Basecalled reads length vs alignments length</h3>
-        ''' + density_contour_plot(names, reads_statistics, alignment_statistics, "Length", "AlignmentLength", "Reads Length", "Alignment Length") + '''
+        <iframe height="600px" width="100%" frameBorder="0" srcdoc=' ''' + density_contour_plot(names, reads_statistics, alignment_statistics, "Length", "AlignmentLength", "Reads Length", "Alignment Length") + ''' '></iframe>
 
         <h3>Reads PHRED quality vs alignments identity</h3>
-        ''' + density_contour_plot(names, reads_statistics, alignment_statistics, "MedianPHRED", "Match", "Reads Median PHRED Score", "Alignment Identity") + '''
+        <iframe height="600px" width="100%" frameBorder="0" srcdoc=' ''' + density_contour_plot(names, reads_statistics, alignment_statistics, "MedianPHRED", "Match", "Reads Median PHRED Score", "Alignment Identity") + ''' '></iframe>
     </body>
 </html>'''
 
