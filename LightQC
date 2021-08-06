@@ -45,11 +45,11 @@ pd.set_option('colheader_justify', 'center')
 
 def main():
     init_logging()
-    logging.info("LoReQC (version {})".format(__version__))
+    logging.info("LightQC (version {})".format(__version__))
 
     args = get_arguments()
 
-    logging.info("Starting LoReQC Pipeline")
+    logging.info("Starting LightQC Pipeline")
 
     ######################################################################
     # STARTING THE PIPELINE 
@@ -142,17 +142,20 @@ def main():
     names = sorted(list(files.keys()))
 
     # Prepare the data and generate the html report
-    write_html(names, reads_statistics, alignment_statistics, os.path.join(args.output, 'Report.html'))
-    write_csv(names, reads_statistics, alignment_statistics, os.path.join(args.output, 'Data.csv'))
+    # Temporary change the working directory to the output directory for plotly 
+    os.chdir(args.output)
+    write_html(names, reads_statistics, alignment_statistics, 'Report.html')
+    write_csv(names, reads_statistics, alignment_statistics, 'Data.csv')
 
     # Remove the temporary files 
-    to_remove = glob.glob(args.output + '/tmp_*')
+    to_remove = glob.glob('tmp_*')
 
     for path in to_remove:
         try:
             os.remove(path)
+            shutil.rmtree('iframe_figures')
         except:
-            logging.warning('An error occured when remove the temporary PAF file.')
+            logging.warning('An error occured when remove the temporary files.')
 
     # Close the empty file
     fnull.close()
