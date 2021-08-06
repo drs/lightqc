@@ -36,10 +36,6 @@ MINIMAP_TAGS = {
 
 # FASTQ Quality Score
 SANGER_SCORE_OFFSET = 33
-QMAPPING = {
-            chr(letter): letter - SANGER_SCORE_OFFSET
-            for letter in range(SANGER_SCORE_OFFSET, 94 + SANGER_SCORE_OFFSET)
-        }
 
 pd.set_option('colheader_justify', 'center')
 
@@ -182,10 +178,10 @@ def parse_paf(in_file, threads):
                 i = 0
             chunks[i].append(line)
 
-            # Process the reads when each threads has 10000 reads to process
+            # Process the alignments when each threads has 100000 alignments to process
             # This seems like a good trade off between the overhead required for 
             # multi-threading and the memory usage required to load the reads in memory
-            if len(chunks[-1]) == 100: 
+            if len(chunks[-1]) == 100000: 
                 content.extend(parse_paf_chunks(chunks, threads))
                 chunks = generate_chunks(threads)
             i += 1
@@ -391,10 +387,10 @@ def parse_fastq(in_file, threads):
             chunks[j].append((rid, length, line.strip()))
             j += 1
 
-            # Process the reads when each threads has 1000 reads to process
+            # Process the reads when each threads has 2000 reads to process
             # This seems like a good trade off between the overhead required for 
             # multi-threading and the memory usage required to load the reads in memory
-            if len(chunks[-1]) == 1000: 
+            if len(chunks[-1]) == 2000: 
                 content.extend(parse_fastq_chunks(chunks, threads))
                 chunks = generate_chunks(threads)
         i += 1
@@ -453,7 +449,8 @@ def qual_to_phred(qual):
         Numpy array of PHRED scores
     """
 
-    phred = np.array([QMAPPING[letter] for letter in qual], dtype=np.int8)
+    a = np.array(list(qual), 'U1').view(np.uint32)
+    phred = a - SANGER_SCORE_OFFSET
     return np.median(phred)
 
 
