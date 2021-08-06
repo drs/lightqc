@@ -14,7 +14,9 @@ This software only depends on Python 3 with some additionnal packages.
 pip install pandas, numpy, scipy, plotly
 ```
 
-2. Download this script and add the script location to the path or move the script to a localisation in your path (such as $HOME/bin). 
+2. Install Minimap2 as described in [Minimap2 Installation](https://github.com/lh3/minimap2#install). Minimap2 must be avaiable on the PATH for LightQC. 
+
+3. Download this script and add the script location to the path or move the script to a localisation in your path (such as $HOME/bin). 
 
 ```
 git clone https://github.com/drs/LightQC
