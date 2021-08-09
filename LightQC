@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-import os, re, logging, argparse, sys, multiprocessing, shutil, subprocess, itertools, gzip, glob
+import os, re, logging, argparse, sys, multiprocessing, shutil, subprocess, itertools, gzip, glob, datetime
 
 import pandas as pd
 import numpy as np
@@ -153,9 +153,14 @@ def main():
     for path in to_remove:
         try:
             os.remove(path)
-            shutil.rmtree('iframe_figures')
         except:
             logging.warning('An error occured when remove the temporary files.')
+
+    try:
+        shutil.rmtree('iframe_figures')
+    except:
+        logging.warning('An error occured when remove the temporary files.')
+
 
     # Close the empty file
     fnull.close()
@@ -507,12 +512,13 @@ def get_arguments():
                       help='Genome file (FASTA)')
     input_group.add_argument('-r', '--reads', required=True, type=str, nargs='+',
                       help='Reads file (FASTQ)')
-    input_group.add_argument('-x', '--read-type', required=True,type=str,  
+    input_group.add_argument('-x', '--read-type', required=True, type=str,  
                       help='Read type (nanopore or pacbio) for minimap2 presets')
 
     output_group = parser.add_argument_group('Output')
-    output_group.add_argument('-o', '--output', required=True, 
-                        help='Output directory')
+    output_group.add_argument('-o', '--output', required=False,
+                              default='LightQC-{}'.format(datetime.datetime.now().strftime('%Y-%m-%d_%H%M%S')),
+                              help='Output directory')
     output_group.add_argument('--force', required=False, action='store_true',
                         help='Overwrite existing file')
 
@@ -628,14 +634,14 @@ def N50(lengths):
     return n50
 
 
-def density_plot(names, in_df, variable_name, xlab, zscore_threshold=3):
+def density_plot(names, in_df, variable_name, xlab):
     """Returns a Plotly Gaussian Kernel Density plot"""
 
     # Prepare the data
     prep_df = pd.DataFrame()
     for name in names:
         stats_dataset = in_df[name]
-        variable = stats_dataset[variable_name][(zscore(stats_dataset[variable_name]) < zscore_threshold)]
+        variable = stats_dataset[variable_name]
         prep_df[name] = variable
 
     # Generate the plot
@@ -667,19 +673,17 @@ def density_plot(names, in_df, variable_name, xlab, zscore_threshold=3):
     return get_iframe_div()
 
 
-def density_contour_plot(names, reads_statistics, alignments_statistics, xvar, yvar, xlab, ylab, zscore_threshold = 1):
+def density_contour_plot(names, reads_statistics, alignments_statistics, xvar, yvar, xlab, ylab):
     """Returns a Plotly Density Contour plot"""
 
     # Prepare the data
     intermediate_df = []
     for name in names:
         reads_dataset = reads_statistics[name]
-        filtered_reads = reads_dataset[(zscore(reads_dataset[xvar]) < zscore_threshold)]
-        reads = filtered_reads[["ID", xvar]]
+        reads = reads_dataset[["ID", xvar]]
 
         alignments_dataset = alignments_statistics[name]
-        filtered_alignments = alignments_dataset[(zscore(alignments_dataset[yvar]) < zscore_threshold)]
-        alignments = filtered_alignments[["ID", yvar]]
+        alignments = alignments_dataset[["ID", yvar]]
         merge_df = pd.merge(reads, alignments, how ='inner', on =['ID'])
 
         merge_df["Name"] = name
@@ -688,7 +692,7 @@ def density_contour_plot(names, reads_statistics, alignments_statistics, xvar, y
 
     prep_df = pd.concat(intermediate_df)
 
-    fig = px.density_contour(prep_df, x=xvar, y=yvar, color="Name", 
+    fig = px.density_contour(prep_df, x=xvar, y=yvar, color="Name", nbinsx=100, nbinsy=100,
     template="simple_white", width=None, height=500, 
     labels={xvar: xlab,  yvar: ylab, "variable": "Dataset"})
 
