@@ -361,6 +361,11 @@ def parse_fastq(in_file, threads):
         handle = gzip.open(in_file, 'rt')
     else:
         handle = open(in_file, 'r')
+
+     # Set the maximum number of threads to 8 as performance decreases with a 
+    # larger number of threads 
+    if threads > 8:
+        threads = 8
     
     content = []
     chunks_size = threads*1000*4
