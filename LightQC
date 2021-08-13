@@ -4,6 +4,7 @@ import os, re, logging, argparse, sys, multiprocessing, shutil, subprocess, iter
 
 import pandas as pd
 import numpy as np
+from pandas.core.reshape.merge import merge
 from scipy.stats import gaussian_kde, zscore
 
 import plotly.express as px
@@ -178,50 +179,33 @@ def parse_paf(in_file, threads):
             ID | Aligned | Error | Match | Mismatch | Insertion | Deletion
     """
 
-    chunks = generate_chunks(threads)
-
     content = []
-    
-    i = 0
+    chunks_size = threads*10000
+
     with open(in_file) as handle:
-        for line in handle:
-            if i >= threads:
-                i = 0
-            chunks[i].append(line)
+        while True:
+            next_lines = list(itertools.islice(handle, chunks_size))
 
-            # Process the alignments when each threads has 100000 alignments to process
-            # This seems like a good trade off between the overhead required for 
-            # multi-threading and the memory usage required to load the reads in memory
-            if len(chunks[-1]) == 100000: 
-                content.extend(parse_paf_chunks(chunks, threads))
-                chunks = generate_chunks(threads)
-            i += 1
+            if not next_lines:
+                break
 
-    content.extend(parse_paf_chunks(chunks, threads))
+            # Set the number of processing threads to the number of line if it is smaller 
+            if len(next_lines) < threads:
+                threads = len(next_lines)
 
+            lines = yield_chunks(next_lines, threads)
+            chunks=[next(lines) for i in range(threads)]
+            
+            pool = multiprocessing.Pool(processes=threads)
+            content.extend(list(itertools.chain.from_iterable(pool.imap_unordered(process_paf_chunk, chunks))))
+            pool.close()
+            pool.join()
+        
     ali_df = pd.DataFrame(content, columns=['ID', 'AlignmentLength', 'AlignedFraction', 'Error', 'Match', 'Mismatch', 'Insertion', 'Deletion', 'Target', 'Start', 'End'])
     ali_df.sort_values(by = ['ID', 'AlignedFraction'], inplace=True, ascending=False)
     ali_df.drop_duplicates(subset='ID', keep='first', inplace=True)
 
     return ali_df
-
-
-def parse_paf_chunks(chunks, threads):
-    """Parse the fastq chunks in multi-threads
-    
-    Argument:
-        chunks: List of the FASTQ chunks to be processed
-        
-    Return:
-        List of the parsed FASTQ lines
-    """
-
-    pool = multiprocessing.Pool(processes=threads)
-    res = list(itertools.chain.from_iterable(pool.imap(process_paf_chunk, chunks)))
-    pool.close()
-    pool.join()
-
-    return res
 
 
 def process_paf_chunk(chunk):
@@ -372,41 +356,33 @@ def parse_fastq(in_file, threads):
     Return:
         Reads statistics dataframe
     """
-
     # Open the FASTQ file in gzip or uncompressed format
     if in_file.endswith(".gz"):
         handle = gzip.open(in_file, 'rt')
     else:
         handle = open(in_file, 'r')
-
-    # Generate the chunks
-    chunks = generate_chunks(threads)
-
+    
     content = []
+    chunks_size = threads*1000*4
+    
+    while True:
+        next_lines = list(itertools.islice(handle, chunks_size))
 
-    i = 0
-    j = 0
-    for line in handle:
-        if j >= threads:
-            j = 0
-            
-        if i%4 == 0:
-            rid = line.split(' ')[0][1:]
-        elif i%4 == 1:
-            length = len(line.strip())
-        elif i%4 == 3:
-            chunks[j].append((rid, length, line.strip()))
-            j += 1
+        if not next_lines:
+            break
 
-            # Process the reads when each threads has 2000 reads to process
-            # This seems like a good trade off between the overhead required for 
-            # multi-threading and the memory usage required to load the reads in memory
-            if len(chunks[-1]) == 2000: 
-                content.extend(parse_fastq_chunks(chunks, threads))
-                chunks = generate_chunks(threads)
-        i += 1
+        # Set the number of processing threads to the number of records if it is smaller 
+        if len(next_lines)*4 < threads: 
+            threads = len(next_lines)*4
 
-    content.extend(parse_fastq_chunks(chunks, threads))
+        rids = yield_chunks([l.split(' ')[0][1:] for l in next_lines[::4]], threads)
+        qual = yield_chunks([l.strip() for l in next_lines[3::4]], threads)
+        chunks=[[next(rids), next(qual)] for i in range(threads)]
+
+        pool = multiprocessing.Pool(processes=threads)
+        content.extend(list(itertools.chain.from_iterable(pool.imap_unordered(parse_fastq_chunk, chunks))))
+        pool.close()
+        pool.join()
 
     handle.close()
 
@@ -415,22 +391,11 @@ def parse_fastq(in_file, threads):
     return reads_df
 
 
-def parse_fastq_chunks(chunks, threads):
-    """Parse the fastq chunks in multi-threads
-    
-    Argument:
-        chunks: List of the FASTQ chunks to be processed
-        
-    Return:
-        List of the parsed FASTQ lines
-    """
-
-    pool = multiprocessing.Pool(processes=threads)
-    res = list(itertools.chain.from_iterable(pool.imap(parse_fastq_chunk, chunks)))
-    pool.close()
-    pool.join()
-
-    return res
+def yield_chunks(lst, n):
+    """Yield successive chunks from a list."""
+    l = round(len(lst)/n) # Length of each chunks
+    for i in range(0, len(lst), l):
+        yield lst[i:i+l]
 
 
 def parse_fastq_chunk(chunk):
@@ -443,10 +408,7 @@ def parse_fastq_chunk(chunk):
         Parsed chunk as a list of tuples
     """
 
-    for i in range(0, len(chunk)):
-        chunk[i] = ((chunk[i][0], chunk[i][1], qual_to_phred(chunk[i][2])))
-    
-    return chunk
+    return [((chunk[0][i], len(chunk[1][i]), qual_to_phred(chunk[1][i]))) for i in range(0, len(chunk[0]))]
 
 
 def qual_to_phred(qual):
@@ -463,14 +425,6 @@ def qual_to_phred(qual):
     a = np.array(list(qual), 'U1').view(np.uint32)
     phred = a - SANGER_SCORE_OFFSET
     return np.median(phred)
-
-
-def generate_chunks(length):
-    """Return a list of empty list with the given length"""
-    chunks = []
-    for i in range(0, length):
-        chunks.append([])
-    return chunks
 
 
 def init_logging():
@@ -692,7 +646,7 @@ def density_contour_plot(names, reads_statistics, alignments_statistics, xvar, y
 
     prep_df = pd.concat(intermediate_df)
 
-    fig = px.density_contour(prep_df, x=xvar, y=yvar, color="Name", nbinsx=100, nbinsy=100,
+    fig = px.density_contour(prep_df, x=xvar, y=yvar, color="Name", nbinsx=50, nbinsy=50,
     template="simple_white", width=None, height=500, 
     labels={xvar: xlab,  yvar: ylab, "variable": "Dataset"})
 
@@ -727,7 +681,7 @@ def write_html(names, reads_statistics, alignment_statistics, out_file):
         <style>body{ margin:0 100; background:whitesmoke; }</style>
     </head>
     <body>
-        <h1>LoReQC: Long Reads Quality Control Report</h1>
+        <h1>LightQC: Long Reads Quality Control Report</h1>
 
         <h3>Summary</h3></br>
         ''' + summary(names, reads_statistics, alignment_statistics) + '''
