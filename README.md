@@ -24,13 +24,11 @@ git clone https://github.com/drs/LightQC
 
 ## Usage 
 
-Typical usage. 
+Typical usage : 
 
 ```
 LightQC -g genome.fasta -r reads.fastq -x nanopore -o LightQC.html 
 ```
-
-LightQC is not designed to run without a reference genome. If no reference genome are available the Nanopore/PacBio reads can be assembled with miniams+Racon pipeline to rapidly generate a fairly accurate draft assembly. 
 
 ## Feature Request 
 
@@ -46,4 +44,4 @@ While this tools aims at providing a fast and lightweight all-in-one solution fo
 - [NanoPlot](https://github.com/wdecoster/NanoPlot)  
 - [pycoQC](https://github.com/tleonardi/pycoQC)  
 
-Some parts of this tools are heavily inspired from these software and mostly from pycoQC. 
+Some parts of this tools are heavily inspired from these software, mostly from pycoQC. 
