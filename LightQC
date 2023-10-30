@@ -37,12 +37,6 @@ MINIMAP_TAGS = {
     'rl' : 'RepeatLength'
 }
 
-# FASTQ Quality Score
-SANGER_SCORE_OFFSET = 33
-
-# Global variable 
-_generate_phred_statistics=False
-
 pd.set_option('colheader_justify', 'center')
 
 def main():
@@ -90,51 +84,43 @@ def main():
     ######################################################################
 
     # Validate the input file format
+    fmts = []
     for file in args.reads:
         try:
-            get_fastx_format(file)
+            fmts.append(get_fastx_format(file))
         except ValueError:
             logging.error("Input file {} does not appear to be either a FASTQ or FASTA file format.".format(file))
-            sys.exit(1)
+            sys.exit(1)    
 
-    # Determine if the PHRED statistics needs to be computed (very slow)
-    global _generate_phred_statistics
-    if args.phred_statistics:
-        _generate_phred_statistics=True
-
-        # Check if one of more file are in FASTA format based on the files extentions
-        # PHRED score are automatically ignore when a FASTA file is included 
-        for file in args.reads:
-            if file.endswith(".fa.gz") or file.endswith(".fa") or file.endswith(".fasta.gz") or file.endswith(".fasta"):
-                logging.warning("Found at least one FASTA file in the reads files. --phred-statistics option will be ignored.")
-                _generate_phred_statistics=False
-                break
+    # Check if one of more file are in FASTA format based on the files extentions
+    # PHRED score are automatically ignore when a FASTA file is included 
+    generate_phred_statistics=True
+    if 'fasta' in fmts:
+        generate_phred_statistics=False
+        logging.warning("Found at least one FASTA file in the reads files. Reads quality score (PHRED) statistics will not be computed.")
     
     # Generate the names based on the file name
-    files = dict()
+    names = []
     for file in args.reads:
         name = os.path.splitext(os.path.basename(file.strip('.gz')))[0]
-
-        if not name in files:
-            files[name] = file 
-        else:
+        if name in names: # Do not allow duplicate names
             logging.error("File names must be unique.")
             sys.exit(1)
+        names.append(name)
     
     # Generate the reads statistics
     logging.info("Parsing the FASTX files")
 
     reads_statistics = dict()
-    if _generate_phred_statistics:
-        for name, file in files.items():
-            reads_df = parse_fastq_phred(file, args.threads)
-            reads_statistics[name] = reads_df
-    else:
-        for name, file in files.items():
-            reads_df = parse_fastx(file)
-            reads_statistics[name] = reads_df
-
-
+    for file, name, fmt in zip(args.reads, names, fmts):
+        if fmt == 'fastq':
+            if generate_phred_statistics:
+                reads_statistics[name] = pd.DataFrame(extract_metrics_from_fastq(file, generate_phred_statistics), columns=['ID', 'Length', 'MedianPHRED'])
+            else:
+                reads_statistics[name] = pd.DataFrame(extract_metrics_from_fastq(file, generate_phred_statistics), columns=['ID', 'Length'])
+        else:
+            reads_statistics[name] = pd.DataFrame(extract_metrics_from_fasta(file), columns=['ID', 'Length'])
+    
     ######################################################################
     # ALIGN NANOPORE READS AGAINST THE REFERENCE
     # The reads are aligned against the reference with minimap2
@@ -144,7 +130,7 @@ def main():
 
     logging.info("Aligning the reads against the assembly")
 
-    for name, file in files.items():
+    for file, name in zip(args.reads, names):
         paf_file = os.path.join(args.output, 'tmp_mapping_{}.paf'.format(name))
         command = ["minimap2", "-x", args.read_type, '-t', str(args.threads), '--cs', '--secondary=no', args.genome, file]
         f = open(paf_file, 'w')
@@ -380,7 +366,7 @@ def get_fastx_format(path):
     Raise:
         ValueError is the file does not start with '@' or '>'
     """
-    if is_gzipped:
+    if is_gzipped(path):
         handle = gzip.open(path, 'rt')
     else:
         handle = open(path, 'r')
@@ -394,88 +380,59 @@ def get_fastx_format(path):
         raise ValueError
         
 
-def parse_fastx(path):
-    """
-    Generate the reads statisrics from the FASTA/FASTQ file. 
-    The parsed is used when at least one FASTA file is in the input and
-    ignores the PHRED score. 
-
-    Use the function "parse_fastq_phred" when not FASTA file are in the input
-
-    Arguments:
-        in_file: FASTA/Q file
-    Return:
-        Reads statistics dataframe
-    """
-
-    if is_gzipped(path):
-        handle = gzip.open(path, 'rt')
+def extract_metrics_from_fastq(fastq_file, generate_phred_statistics):
+    if is_gzipped(fastq_file):
+        handle = gzip.open(fastq_file, 'rt')
     else:
-        handle = open(path, 'r')
+        handle = open(fastq_file, 'r')
 
-    try:
-        fmt = get_fastx_format(path)
-    except ValueError:
-        logging.error("Input file {} does not appear to be either a FASTQ or FASTA file format.".format(path))
-        sys.exit(1)
-    
     content = []
-    for record in SeqIO.parse(handle, fmt):
-        content.append([record.id, len(record.seq)])
-
-    logging.info("Done parsing FASTX file.")
-
-    reads_df = pd.DataFrame(content, columns=['ID', 'Length'])
-    handle.close()
-    return reads_df
-
-
-def parse_fastq_phred(in_file, threads):
-    """
-    Generate the reads statistics from the FASTQ file
-    Arguments:
-        in_file: FASTQ file
-    Return:
-        Reads statistics dataframe
-    """
-    # Open the FASTQ file in gzip or uncompressed format
-    if in_file.endswith(".gz"):
-        handle = gzip.open(in_file, 'rt')
-    else:
-        handle = open(in_file, 'r')
-
-     # Set the maximum number of threads to 8 as performance decreases with a 
-    # larger number of threads 
-    if threads > 8:
-        threads = 8
+    for lineno, line in enumerate(handle):
+        if lineno % 4 == 0:
+            rid = line.split(' ')[0][1:]
+        elif (lineno+3) %4 == 0:
+            length = len(line.strip())
+        elif (lineno+1) % 4 == 0:
+            if generate_phred_statistics:
+                quality_array = np.frombuffer(line.strip().encode(), dtype=np.int8)-33
+                qscore = int(np.median(quality_array))
+                content.append([rid, length, qscore])
+            else:
+                content.append([rid, length])
     
-    content = []
-    chunks_size = threads*1000*4
-    
-    while True:
-        next_lines = list(itertools.islice(handle, chunks_size))
-
-        if not next_lines:
-            break
-
-        # Set the number of processing threads to the number of records if it is smaller 
-        if len(next_lines)*4 < threads: 
-            threads = len(next_lines)*4
-
-        rids = yield_chunks([l.split(' ')[0][1:] for l in next_lines[::4]], threads)
-        qual = yield_chunks([l.strip() for l in next_lines[3::4]], threads)
-        chunks=[[next(rids), next(qual)] for i in range(threads)]
-
-        pool = multiprocessing.Pool(processes=threads)
-        content.extend(list(itertools.chain.from_iterable(pool.imap_unordered(parse_fastq_chunk, chunks))))
-        pool.close()
-        pool.join()
-
     handle.close()
 
-    reads_df = pd.DataFrame(content, columns=['ID', 'Length', 'MedianPHRED'])
+    return content
+
+
+def extract_metrics_from_fasta(fasta_file):
+    if is_gzipped(fasta_file):
+        handle = gzip.open(fasta_file, 'rt')
+    else:
+        handle = open(fasta_file, 'r')
+
+    content = []
+    sequence_id = None
+    sequence = ""
+
+    for line in handle:
+        line = line.strip()
+        if line.startswith(">"):
+            # Save the previous sequence data
+            if sequence_id is not None:
+                content.append([sequence_id, len(sequence)])
+
+            sequence_id = line[1:]
+            sequence = ""
+        else:
+            sequence += line
+    # Save the last sequence
+    if sequence_id is not None:
+        content.append([sequence_id, len(sequence)])
     
-    return reads_df
+    handle.close()
+
+    return content
 
 
 def yield_chunks(lst, n):
@@ -483,35 +440,6 @@ def yield_chunks(lst, n):
     l = round(len(lst)/n) # Length of each chunks
     for i in range(0, len(lst), l):
         yield lst[i:i+l]
-
-
-def parse_fastq_chunk(chunk):
-    """Parse the fastq line
-    
-    Argument:
-        chunk: Chunk of FASTQ file
-        
-    Return:
-        Parsed chunk as a list of tuples
-    """
-
-    return [((chunk[0][i].strip(), len(chunk[1][i]), qual_to_phred(chunk[1][i]))) for i in range(0, len(chunk[0]))]
-
-
-def qual_to_phred(qual):
-    """
-    Convert a quality string to a PHRED score array
-    
-    Arguments:
-        qual: Quality string
-
-    Return:
-        Numpy array of PHRED scores
-    """
-
-    a = np.array(list(qual), 'U1').view(np.uint32)
-    phred = a - SANGER_SCORE_OFFSET
-    return np.median(phred)
 
 
 def init_logging():
@@ -535,7 +463,7 @@ def check_dependencies():
     if shutil.which("minimap2"):
         proc = subprocess.run(["minimap2", "-V"], stdout=subprocess.PIPE)
         version = proc.stdout.decode().strip()
-        logging.info("Found minimap2 (v{})".format(version))
+        logging.info("Using minimap2 (v{})".format(version))
     else:
         logging.error("Cannot find minimap2")
         sys.exit(1)
@@ -781,7 +709,7 @@ def write_html(out_file, names, alignment_statistics, reads_statistics=None):
         <h3>Basecalled reads length</h3>
         <iframe height="600px" width="100%" frameBorder="0" srcdoc=' ''' + density_plot(names, reads_statistics, 'Length', "Reads Length") + ''' '></iframe>'''
 
-    if _generate_phred_statistics:
+    if generate_phred_statistics:
         html_string = html_string + '''
         <h3>Basecalled reads PHRED quality</h3>
         <iframe height="600px" width="100%" frameBorder="0" srcdoc=' ''' + density_plot(names, reads_statistics, 'MedianPHRED', "Reads Median PHRED Score") + ''' '></iframe>
@@ -796,7 +724,7 @@ def write_html(out_file, names, alignment_statistics, reads_statistics=None):
         <h3>Basecalled reads length vs alignments length</h3>
         <iframe height="600px" width="100%" frameBorder="0" srcdoc=' ''' + density_contour_plot(names, reads_statistics, alignment_statistics, "Length", "AlignmentLength", "Reads Length", "Alignment Length") + ''' '></iframe>'''
 
-    if _generate_phred_statistics:
+    if generate_phred_statistics:
         html_string = html_string + '''
         <h3>Reads PHRED quality vs alignments identity</h3>
         <iframe height="600px" width="100%" frameBorder="0" srcdoc=' ''' + density_contour_plot(names, reads_statistics, alignment_statistics, "MedianPHRED", "Match", "Reads Median PHRED Score", "Alignment Identity") + ''' '></iframe>
@@ -804,7 +732,6 @@ def write_html(out_file, names, alignment_statistics, reads_statistics=None):
     html_string = html_string + '''
     </body>
 </html>'''
-
 
     with open(out_file, 'w') as w_handle:
         w_handle.write(html_string)
