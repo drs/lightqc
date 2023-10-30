@@ -4,12 +4,12 @@ import os, re, logging, argparse, sys, multiprocessing, shutil, subprocess, iter
 
 import pandas as pd
 import numpy as np
+from Bio import SeqIO
 from pandas.core.reshape.merge import merge
 from scipy.stats import gaussian_kde, zscore
 
 import plotly.express as px
 import plotly.io as pio
-
 
 pio.renderers.default = "iframe_connected"
 __version__ = "0.1.0"
@@ -40,9 +40,10 @@ MINIMAP_TAGS = {
 # FASTQ Quality Score
 SANGER_SCORE_OFFSET = 33
 
+# Global variable 
+_generate_phred_statistics=False
 
 pd.set_option('colheader_justify', 'center')
-
 
 def main():
     init_logging()
@@ -88,8 +89,27 @@ def main():
     # Reads the read file to get the reads lengths 
     ######################################################################
 
-    logging.info("Parsing the FASTQ file")
+    # Validate the input file format
+    for file in args.reads:
+        try:
+            get_fastx_format(file)
+        except ValueError:
+            logging.error("Input file {} does not appear to be either a FASTQ or FASTA file format.".format(file))
+            sys.exit(1)
 
+    # Determine if the PHRED statistics needs to be computed (very slow)
+    global _generate_phred_statistics
+    if args.phred_statistics:
+        _generate_phred_statistics=True
+
+        # Check if one of more file are in FASTA format based on the files extentions
+        # PHRED score are automatically ignore when a FASTA file is included 
+        for file in args.reads:
+            if file.endswith(".fa.gz") or file.endswith(".fa") or file.endswith(".fasta.gz") or file.endswith(".fasta"):
+                logging.warning("Found at least one FASTA file in the reads files. --phred-statistics option will be ignored.")
+                _generate_phred_statistics=False
+                break
+    
     # Generate the names based on the file name
     files = dict()
     for file in args.reads:
@@ -100,12 +120,20 @@ def main():
         else:
             logging.error("File names must be unique.")
             sys.exit(1)
-
+    
     # Generate the reads statistics
+    logging.info("Parsing the FASTX files")
+
     reads_statistics = dict()
-    for name, file in files.items():
-        reads_df = parse_fastq(file, args.threads)
-        reads_statistics[name] = reads_df
+    if _generate_phred_statistics:
+        for name, file in files.items():
+            reads_df = parse_fastq_phred(file, args.threads)
+            reads_statistics[name] = reads_df
+    else:
+        for name, file in files.items():
+            reads_df = parse_fastx(file)
+            reads_statistics[name] = reads_df
+
 
     ######################################################################
     # ALIGN NANOPORE READS AGAINST THE REFERENCE
@@ -138,15 +166,16 @@ def main():
         alignment_statistics[name] = ali_df
 
     logging.info('Generating statistics')
-    
+
     # Generate the alignment stats
     names = sorted(list(files.keys()))
 
     # Prepare the data and generate the html report
     # Temporary change the working directory to the output directory for plotly 
     os.chdir(args.output)
-    write_html(names, reads_statistics, alignment_statistics, 'Report.html')
-    write_csv(names, reads_statistics, alignment_statistics, 'Data.csv')
+
+    write_html(out_file='Report.html', names=names, alignment_statistics=alignment_statistics, reads_statistics=reads_statistics)
+    write_csv(out_file='Data.csv', names=names, alignment_statistics=alignment_statistics, reads_statistics=reads_statistics)
 
     # Remove the temporary files 
     to_remove = glob.glob('tmp_*')
@@ -204,7 +233,6 @@ def parse_paf(in_file, threads):
     ali_df = pd.DataFrame(content, columns=['ID', 'AlignmentLength', 'AlignedFraction', 'Error', 'Match', 'Mismatch', 'Insertion', 'Deletion', 'Target', 'Start', 'End'])
     ali_df.sort_values(by = ['ID', 'AlignedFraction'], inplace=True, ascending=False)
     ali_df.drop_duplicates(subset='ID', keep='first', inplace=True)
-
     return ali_df
 
 
@@ -221,7 +249,6 @@ def process_paf_chunk(chunk):
     alignments = []
     for line in chunk:
         alignments.append(process_paf_line(line))
-
     return alignments
 
 
@@ -238,30 +265,15 @@ def process_paf_line(line):
 
     # Prepare the line
     lst = line.strip().split('\t')
-    default_fields = lst[:12]
-    sam_keys_values = lst[12:]
-    sam_fields = parse_sam_fields(sam_keys_values)
-
-    # Extract the required fields from the PAF file
-    query_name = default_fields[0]
-    query_length = int(default_fields[1])
-    query_start = int(default_fields[2])
-    query_end = int(default_fields[3])
-    #if default_fields[4] == '+':
-    #    strand = 0
-    #else:
-    #    strand = 1
-    target_name = default_fields[5]
-    target_start = int(default_fields[7])
-    target_end = int(default_fields[8])
+    query_name, query_length, query_start, query_end, _, target_name, _, target_start, target_end = lst[:9]
+    sam_fields = parse_sam_fields(lst[12:])
     
     cs_count, cs_tags = parse_cs_tag(sam_fields['cs'])
     cs_df = pd.DataFrame({'Tag':cs_tags, 'Count':cs_count})
     cs_df.sort_values(by = 'Tag', inplace=True)
     cs_sum = cs_df.groupby(['Tag']).sum()
 
-    # Generate the statistics
-    
+    # Generate the statistics    
     try:
         match = cs_sum.loc[0]['Count']
     except KeyError:
@@ -290,9 +302,9 @@ def process_paf_line(line):
     deletion = (deletion/alignment_length)*100
     insertion = (insertion/alignment_length)*100
 
-    aligned = (query_end-query_start)/query_length
+    aligned = (int(query_end)-int(query_start))/int(query_length)
 
-    return (query_name, alignment_length, aligned, error, match, mismatch, insertion, deletion, target_name, target_start, target_end)
+    return (query_name, alignment_length, aligned, error, match, mismatch, insertion, deletion, target_name, int(target_start), int(target_end))
 
 
 def parse_cs_tag(cs_tag):
@@ -308,24 +320,25 @@ def parse_cs_tag(cs_tag):
     """
 
     cs_lst = re.findall(CS_RE, cs_tag)
-    
-    length = np.empty(len(cs_lst), dtype=np.int16)
-    feature_type = np.empty(len(cs_lst), dtype=np.int8)
-    i = 0
-    for tag in cs_lst:
-        if tag[0] == ':':
-            feature_type[i] = 0
-            length[i] = int(tag[1:])
-        elif tag[0] == '*':
-            feature_type[i] = 1
-            length[i] = 1
-        elif tag[0] == '-':
-            feature_type[i] = 2
-            length[i] = len(tag[1:])
-        elif tag[0] == '+':
-            feature_type[i] = 3
-            length[i] = len(tag[1:])
-        i += 1
+
+    feature_type = np.array([0 if tag[0] == ':' else 1 if tag[0] == '*' else 2 if tag[0] == '-' else 3 for tag in cs_lst], dtype=np.int8)
+    length = np.array([int(tag[1:]) if tag[0] == ':' else 1 if tag[0] == '*' else len(tag[1:]) for tag in cs_lst], dtype=np.int16)
+        
+    #i = 0
+    #for tag in cs_lst:
+    #    if tag[0] == ':':
+    #        feature_type[i] = 0
+    #        length[i] = int(tag[1:])
+    #    elif tag[0] == '*':
+    #        feature_type[i] = 1
+    #        length[i] = 1
+    #    elif tag[0] == '-':
+    #        feature_type[i] = 2
+    #        length[i] = len(tag[1:])
+    #    elif tag[0] == '+':
+    #        feature_type[i] = 3
+    #        length[i] = len(tag[1:])
+    #    i += 1
 
     return length, feature_type
 
@@ -346,13 +359,82 @@ def parse_sam_fields(sam_keys_values):
     return sam_dict
 
 
-def parse_fastq(in_file, threads):
+def is_gzipped(path):
     """
-    Generate the reads statistics from the FASTQ file
+    Read the magic number at the beginning of a file to check if the file is GZipped (first 2 bytes are 1f 8b). 
+
+    Return: 
+        True is a file is GZipped, False otherwise
+    """
+    with open(path, "rb") as h:
+        return h.read(2) == b'\x1f\x8b'
+
+
+def get_fastx_format(path):
+    """
+    Guess a FASTX file format based on the first caracter. 
+
+    Return:
+        fastq or fasta depending on the file type. 
+
+    Raise:
+        ValueError is the file does not start with '@' or '>'
+    """
+    if is_gzipped:
+        handle = gzip.open(path, 'rt')
+    else:
+        handle = open(path, 'r')
+
+    c = handle.read(1)
+    if c == '@':
+        return 'fastq'
+    elif c == '>':
+        return 'fasta'
+    else:
+        raise ValueError
+        
+
+def parse_fastx(path):
+    """
+    Generate the reads statisrics from the FASTA/FASTQ file. 
+    The parsed is used when at least one FASTA file is in the input and
+    ignores the PHRED score. 
+
+    Use the function "parse_fastq_phred" when not FASTA file are in the input
 
     Arguments:
-        in_file: FASTQ file
+        in_file: FASTA/Q file
+    Return:
+        Reads statistics dataframe
+    """
 
+    if is_gzipped(path):
+        handle = gzip.open(path, 'rt')
+    else:
+        handle = open(path, 'r')
+
+    try:
+        fmt = get_fastx_format(path)
+    except ValueError:
+        logging.error("Input file {} does not appear to be either a FASTQ or FASTA file format.".format(path))
+        sys.exit(1)
+    
+    content = []
+    for record in SeqIO.parse(handle, fmt):
+        content.append([record.id, len(record.seq)])
+
+    logging.info("Done parsing FASTX file.")
+
+    reads_df = pd.DataFrame(content, columns=['ID', 'Length'])
+    handle.close()
+    return reads_df
+
+
+def parse_fastq_phred(in_file, threads):
+    """
+    Generate the reads statistics from the FASTQ file
+    Arguments:
+        in_file: FASTQ file
     Return:
         Reads statistics dataframe
     """
@@ -413,7 +495,7 @@ def parse_fastq_chunk(chunk):
         Parsed chunk as a list of tuples
     """
 
-    return [((chunk[0][i], len(chunk[1][i]), qual_to_phred(chunk[1][i]))) for i in range(0, len(chunk[0]))]
+    return [((chunk[0][i].strip(), len(chunk[1][i]), qual_to_phred(chunk[1][i]))) for i in range(0, len(chunk[0]))]
 
 
 def qual_to_phred(qual):
@@ -478,6 +560,8 @@ def get_arguments():
     output_group.add_argument('-o', '--output', required=False,
                               default='LightQC-{}'.format(datetime.datetime.now().strftime('%Y-%m-%d_%H%M%S')),
                               help='Output directory')
+    output_group.add_argument("--phred-statistics", required=False, default=False, 
+                              help="Compute statistics for the PHRED score (slow). Disabled by default.")
     output_group.add_argument('--force', required=False, action='store_true',
                         help='Overwrite existing file')
 
@@ -605,7 +689,7 @@ def density_plot(names, in_df, variable_name, xlab):
 
     # Generate the plot
     plt_df = pd.DataFrame()
-    x_grid = np.linspace(0, prep_df.max().max(), num=100) # Grid used for plotting the density
+    x_grid = np.linspace(0, prep_df.max().max(), num=1000)
     names = []
     for column in prep_df:
         names.append(column)
@@ -637,6 +721,7 @@ def density_contour_plot(names, reads_statistics, alignments_statistics, xvar, y
 
     # Prepare the data
     intermediate_df = []
+
     for name in names:
         reads_dataset = reads_statistics[name]
         reads = reads_dataset[["ID", xvar]]
@@ -679,7 +764,7 @@ def get_iframe_div():
     return content
 
 
-def write_html(names, reads_statistics, alignment_statistics, out_file):
+def write_html(out_file, names, alignment_statistics, reads_statistics=None):
     html_string = '''<html>
     <head>
         <link rel="stylesheet" href="https://maxcdn.bootstrapcdn.com/bootstrap/4.0.0/css/bootstrap.min.css">
@@ -689,26 +774,34 @@ def write_html(names, reads_statistics, alignment_statistics, out_file):
         <h1>LightQC: Long Reads Quality Control Report</h1>
 
         <h3>Summary</h3></br>
-        ''' + summary(names, reads_statistics, alignment_statistics) + '''
+        ''' + summary(names=names, alignment_statistics=alignment_statistics, reads_statistics=reads_statistics) + '''
 
         <h2>Reads Statistics</h2>
 
         <h3>Basecalled reads length</h3>
-        <iframe height="600px" width="100%" frameBorder="0" srcdoc=' ''' + density_plot(names, reads_statistics, 'Length', "Reads Length") + ''' '></iframe>
+        <iframe height="600px" width="100%" frameBorder="0" srcdoc=' ''' + density_plot(names, reads_statistics, 'Length', "Reads Length") + ''' '></iframe>'''
 
+    if _generate_phred_statistics:
+        html_string = html_string + '''
         <h3>Basecalled reads PHRED quality</h3>
         <iframe height="600px" width="100%" frameBorder="0" srcdoc=' ''' + density_plot(names, reads_statistics, 'MedianPHRED', "Reads Median PHRED Score") + ''' '></iframe>
-
+        '''
+        
+    html_string = html_string + '''
         <h2>Alignment Statistics</h2>
 
         <h3>Aligned reads identity</h3>
         <iframe height="600px" width="100%" frameBorder="0" srcdoc=' ''' + density_plot(names, alignment_statistics, 'Error', "Error Rate") + ''' '></iframe>
 
         <h3>Basecalled reads length vs alignments length</h3>
-        <iframe height="600px" width="100%" frameBorder="0" srcdoc=' ''' + density_contour_plot(names, reads_statistics, alignment_statistics, "Length", "AlignmentLength", "Reads Length", "Alignment Length") + ''' '></iframe>
+        <iframe height="600px" width="100%" frameBorder="0" srcdoc=' ''' + density_contour_plot(names, reads_statistics, alignment_statistics, "Length", "AlignmentLength", "Reads Length", "Alignment Length") + ''' '></iframe>'''
 
+    if _generate_phred_statistics:
+        html_string = html_string + '''
         <h3>Reads PHRED quality vs alignments identity</h3>
         <iframe height="600px" width="100%" frameBorder="0" srcdoc=' ''' + density_contour_plot(names, reads_statistics, alignment_statistics, "MedianPHRED", "Match", "Reads Median PHRED Score", "Alignment Identity") + ''' '></iframe>
+        '''
+    html_string = html_string + '''
     </body>
 </html>'''
 
