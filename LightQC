@@ -94,9 +94,9 @@ def main():
 
     # Check if one of more file are in FASTA format based on the files extentions
     # PHRED score are automatically ignore when a FASTA file is included 
-    generate_phred_statistics=True
+    phred_statistics=True
     if 'fasta' in fmts:
-        generate_phred_statistics=False
+        phred_statistics=False
         logging.warning("Found at least one FASTA file in the reads files. Reads quality score (PHRED) statistics will not be computed.")
     
     # Generate the names based on the file name
@@ -114,10 +114,10 @@ def main():
     reads_statistics = dict()
     for file, name, fmt in zip(args.reads, names, fmts):
         if fmt == 'fastq':
-            if generate_phred_statistics:
-                reads_statistics[name] = pd.DataFrame(extract_metrics_from_fastq(file, generate_phred_statistics), columns=['ID', 'Length', 'MedianPHRED'])
+            if phred_statistics:
+                reads_statistics[name] = pd.DataFrame(extract_metrics_from_fastq(file, phred_statistics), columns=['ID', 'Length', 'MedianPHRED'])
             else:
-                reads_statistics[name] = pd.DataFrame(extract_metrics_from_fastq(file, generate_phred_statistics), columns=['ID', 'Length'])
+                reads_statistics[name] = pd.DataFrame(extract_metrics_from_fastq(file, phred_statistics), columns=['ID', 'Length'])
         else:
             reads_statistics[name] = pd.DataFrame(extract_metrics_from_fasta(file), columns=['ID', 'Length'])
     
@@ -146,21 +146,18 @@ def main():
     logging.info('Parsing the alignment')
 
     alignment_statistics = dict()
-    for name, file in files.items():
+    for file, name in zip(args.reads, names):
         paf_file = os.path.join(args.output, 'tmp_mapping_{}.paf'.format(name))
         ali_df = parse_paf(paf_file, args.threads)
         alignment_statistics[name] = ali_df
 
     logging.info('Generating statistics')
 
-    # Generate the alignment stats
-    names = sorted(list(files.keys()))
-
     # Prepare the data and generate the html report
     # Temporary change the working directory to the output directory for plotly 
     os.chdir(args.output)
 
-    write_html(out_file='Report.html', names=names, alignment_statistics=alignment_statistics, reads_statistics=reads_statistics)
+    write_html(out_file='Report.html', names=names, alignment_statistics=alignment_statistics, reads_statistics=reads_statistics, phred_statistics=phred_statistics)
     write_csv(out_file='Data.csv', names=names, alignment_statistics=alignment_statistics, reads_statistics=reads_statistics)
 
     # Remove the temporary files 
@@ -176,7 +173,6 @@ def main():
         shutil.rmtree('iframe_figures')
     except:
         logging.warning('An error occured when remove the temporary files.')
-
 
     # Close the empty file
     fnull.close()
@@ -380,7 +376,7 @@ def get_fastx_format(path):
         raise ValueError
         
 
-def extract_metrics_from_fastq(fastq_file, generate_phred_statistics):
+def extract_metrics_from_fastq(fastq_file, phred_statistics):
     if is_gzipped(fastq_file):
         handle = gzip.open(fastq_file, 'rt')
     else:
@@ -393,7 +389,7 @@ def extract_metrics_from_fastq(fastq_file, generate_phred_statistics):
         elif (lineno+3) %4 == 0:
             length = len(line.strip())
         elif (lineno+1) % 4 == 0:
-            if generate_phred_statistics:
+            if phred_statistics:
                 quality_array = np.frombuffer(line.strip().encode(), dtype=np.int8)-33
                 qscore = int(np.median(quality_array))
                 content.append([rid, length, qscore])
@@ -692,7 +688,7 @@ def get_iframe_div():
     return content
 
 
-def write_html(out_file, names, alignment_statistics, reads_statistics=None):
+def write_html(out_file, names, alignment_statistics, reads_statistics, phred_statistics):
     html_string = '''<html>
     <head>
         <link rel="stylesheet" href="https://maxcdn.bootstrapcdn.com/bootstrap/4.0.0/css/bootstrap.min.css">
@@ -709,7 +705,7 @@ def write_html(out_file, names, alignment_statistics, reads_statistics=None):
         <h3>Basecalled reads length</h3>
         <iframe height="600px" width="100%" frameBorder="0" srcdoc=' ''' + density_plot(names, reads_statistics, 'Length', "Reads Length") + ''' '></iframe>'''
 
-    if generate_phred_statistics:
+    if phred_statistics:
         html_string = html_string + '''
         <h3>Basecalled reads PHRED quality</h3>
         <iframe height="600px" width="100%" frameBorder="0" srcdoc=' ''' + density_plot(names, reads_statistics, 'MedianPHRED', "Reads Median PHRED Score") + ''' '></iframe>
@@ -724,7 +720,7 @@ def write_html(out_file, names, alignment_statistics, reads_statistics=None):
         <h3>Basecalled reads length vs alignments length</h3>
         <iframe height="600px" width="100%" frameBorder="0" srcdoc=' ''' + density_contour_plot(names, reads_statistics, alignment_statistics, "Length", "AlignmentLength", "Reads Length", "Alignment Length") + ''' '></iframe>'''
 
-    if generate_phred_statistics:
+    if phred_statistics:
         html_string = html_string + '''
         <h3>Reads PHRED quality vs alignments identity</h3>
         <iframe height="600px" width="100%" frameBorder="0" srcdoc=' ''' + density_contour_plot(names, reads_statistics, alignment_statistics, "MedianPHRED", "Match", "Reads Median PHRED Score", "Alignment Identity") + ''' '></iframe>
