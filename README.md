@@ -11,7 +11,7 @@ This software only depends on Python 3 with some additional packages.
 1. Install the dependencies with pip. 
 
 ```
-pip install pandas, numpy, scipy, plotly
+pip install pandas, numpy, scipy, plotly, ipykernel
 ```
 
 2. Install Minimap2 as described in [Minimap2 Installation](https://github.com/lh3/minimap2#install). Minimap2 must be available on the PATH for LightQC. 
@@ -27,7 +27,7 @@ git clone https://github.com/drs/LightQC
 Typical usage : 
 
 ```
-LightQC -g genome.fasta -r reads.fastq -x nanopore -o LightQC.html 
+LightQC -g genome.fasta -r reads.fastq -x nanopore -o Output/ 
 ```
 
 ## Feature Request 
